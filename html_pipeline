@@ -1,0 +1,144 @@
+from bs4 import BeautifulSoup
+import pandas as pd
+from pyspark.sql import SparkSession
+
+
+# ---------------------------
+# Config Layer
+# ---------------------------
+class HTMLConfig:
+    def __init__(self, config_df):
+        self.config_df = config_df
+
+    def group_by_file(self):
+        return self.config_df.groupby("file_alias")
+
+    def get_rules(self, df):
+        return {r["rule_name"]: r["rule_value"] for _, r in df.iterrows()}
+
+    def get_field_mappings(self, df):
+        field_df = df[df["rule_name"].isin(["country_col", "value_col"])]
+
+        mappings = {}
+        for field in field_df["field_name"].unique():
+            sub = field_df[field_df["field_name"] == field]
+            mappings[field] = {
+                r["rule_name"]: r["rule_value"]
+                for _, r in sub.iterrows()
+            }
+
+        return mappings
+
+
+# ---------------------------
+# Reader Layer
+# ---------------------------
+class HTMLReader:
+    def read(self, file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return BeautifulSoup(f, "html.parser")
+
+
+# ---------------------------
+# Extractor Layer
+# ---------------------------
+class SectionExtractor:
+    def extract(self, soup, rules):
+        results = []
+
+        sections = soup.find_all(rules["section_tag"])
+
+        for section in sections:
+            title = section.text.lower()
+
+            if rules["black_keyword"] in title:
+                tag = "black_list"
+            elif rules["grey_keyword"] in title:
+                tag = "grey_list"
+            else:
+                continue
+
+            ul = section.find_next(rules.get("list_tag", "ul"))
+
+            for li in ul.find_all(rules.get("item_tag", "li")):
+                country = li.text.strip()
+                results.append({
+                    "country": country,
+                    "scb_presence": f"{country} ({tag})"
+                })
+
+        return pd.DataFrame(results)
+
+
+class SelectorExtractor:
+    def extract(self, soup, rules, mappings):
+        rows = soup.select(rules["row_selector"])
+        results = []
+
+        for row in rows:
+            entry = {}
+
+            for field, m in mappings.items():
+                c = row.select_one(m["country_col"])
+                v = row.select_one(m["value_col"])
+
+                if c and v:
+                    entry["country"] = c.text.strip()
+                    entry[field] = v.text.strip()
+
+            if entry:
+                results.append(entry)
+
+        return pd.DataFrame(results)
+
+
+# ---------------------------
+# File Resolver
+# ---------------------------
+class FileResolver:
+    def get_path(self, file_alias):
+        return f"/path/to/{file_alias}.html"
+
+
+# ---------------------------
+# Pipeline
+# ---------------------------
+class HTMLPipeline:
+    def __init__(self, spark, config_table):
+        self.spark = spark
+        self.config_table = config_table
+
+        self.reader = HTMLReader()
+        self.section_extractor = SectionExtractor()
+        self.selector_extractor = SelectorExtractor()
+        self.file_resolver = FileResolver()
+
+    def load_config(self):
+        return self.spark.table(self.config_table) \
+            .filter("is_active = 'Y' AND source_type = 'html'") \
+            .toPandas()
+
+    def run(self):
+        config_df = self.load_config()
+        config = HTMLConfig(config_df)
+
+        final_df = None
+
+        for file_alias, df in config.group_by_file():
+
+            rules = config.get_rules(df)
+            mappings = config.get_field_mappings(df)
+
+            file_path = self.file_resolver.get_path(file_alias)
+            soup = self.reader.read(file_path)
+
+            if "section_tag" in rules:
+                mapped = self.section_extractor.extract(soup, rules)
+            elif "row_selector" in rules:
+                mapped = self.selector_extractor.extract(soup, rules, mappings)
+            else:
+                raise ValueError("Invalid HTML config")
+
+            final_df = mapped if final_df is None else final_df.merge(mapped, on="country", how="outer")
+
+        return self.spark.createDataFrame(final_df)
