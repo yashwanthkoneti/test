@@ -1,0 +1,133 @@
+import pandas as pd
+from pyspark.sql import SparkSession
+
+
+# ---------------------------
+# Config Layer
+# ---------------------------
+class ExcelConfig:
+    def __init__(self, config_df):
+        self.config_df = config_df
+
+    def group_by_file(self):
+        return self.config_df.groupby("file_alias")
+
+    def get_file_config(self, df):
+        return {
+            r["rule_name"]: r["rule_value"]
+            for _, r in df.iterrows()
+            if r["rule_name"] in ["sheet_name", "skip_rows"]
+        }
+
+    def get_field_mappings(self, df):
+        field_df = df[df["rule_name"].isin(["country_col", "value_col"])]
+
+        mappings = {}
+        for field in field_df["field_name"].unique():
+            sub = field_df[field_df["field_name"] == field]
+            mappings[field] = {
+                r["rule_name"]: r["rule_value"]
+                for _, r in sub.iterrows()
+            }
+
+        return mappings
+
+
+# ---------------------------
+# Reader Layer
+# ---------------------------
+class ExcelReader:
+    def read(self, file_path, sheet_name, skip_rows, usecols):
+        df = pd.read_excel(
+            file_path,
+            sheet_name=sheet_name,
+            skiprows=int(skip_rows),
+            usecols=usecols
+        )
+        df.columns = df.columns.str.strip().str.lower()
+        return df
+
+
+# ---------------------------
+# Resolver Layer
+# ---------------------------
+class ColumnResolver:
+    def resolve(self, mappings):
+        cols = set()
+        for m in mappings.values():
+            cols.add(m["country_col"])
+            cols.add(m["value_col"])
+        return list(cols)
+
+
+# ---------------------------
+# Mapper Layer
+# ---------------------------
+class ExcelMapper:
+    def map(self, df, mappings):
+        result = None
+
+        for field, m in mappings.items():
+            c = m["country_col"].lower()
+            v = m["value_col"].lower()
+
+            temp = df[[c, v]].copy()
+            temp.columns = ["country", field]
+
+            result = temp if result is None else result.merge(temp, on="country", how="outer")
+
+        return result
+
+
+# ---------------------------
+# File Resolver
+# ---------------------------
+class FileResolver:
+    def get_path(self, file_alias):
+        return f"/path/to/{file_alias}.xlsx"
+
+
+# ---------------------------
+# Pipeline
+# ---------------------------
+class ExcelPipeline:
+    def __init__(self, spark, config_table):
+        self.spark = spark
+        self.config_table = config_table
+
+        self.reader = ExcelReader()
+        self.mapper = ExcelMapper()
+        self.col_resolver = ColumnResolver()
+        self.file_resolver = FileResolver()
+
+    def load_config(self):
+        return self.spark.table(self.config_table) \
+            .filter("is_active = 'Y' AND source_type = 'excel'") \
+            .toPandas()
+
+    def run(self):
+        config_df = self.load_config()
+        config = ExcelConfig(config_df)
+
+        final_df = None
+
+        for file_alias, df in config.group_by_file():
+
+            file_cfg = config.get_file_config(df)
+            mappings = config.get_field_mappings(df)
+
+            cols = self.col_resolver.resolve(mappings)
+            file_path = self.file_resolver.get_path(file_alias)
+
+            pdf = self.reader.read(
+                file_path,
+                file_cfg["sheet_name"],
+                file_cfg["skip_rows"],
+                cols
+            )
+
+            mapped = self.mapper.map(pdf, mappings)
+
+            final_df = mapped if final_df is None else final_df.merge(mapped, on="country", how="outer")
+
+        return self.spark.createDataFrame(final_df)
