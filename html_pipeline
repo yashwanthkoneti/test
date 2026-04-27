@@ -1,159 +1,86 @@
-import pandas as pd
 from bs4 import BeautifulSoup
-from pyspark.sql import SparkSession
+import pandas as pd
+import country_converter as coco
+
+cc = coco.CountryConverter()
 
 
 # ---------------------------
-# Config Layer
+# Build keyword-value pairs
 # ---------------------------
-class HTMLConfig:
-    def __init__(self, df):
-        self.df = df
-
-    def group_by_file(self):
-        return self.df.groupby("file_alias")
-
-    def get_rules(self, df):
-        rules = {}
-        for _, r in df.iterrows():
-            rules.setdefault(r["rule_name"], []).append(r["rule_value"])
-        return rules
-
-    def get_field_name(self, df):
-        return df["field_name"].iloc[0]
-
-    # 🔥 Priority pairing (same config)
-    def build_pairs(self, df):
-        grouped = {}
-
-        for _, r in df.iterrows():
-            p = r["priority"]
-            grouped.setdefault(p, {})[r["rule_name"]] = r["rule_value"]
-
-        pairs = []
-        for _, v in grouped.items():
-            if "keyword" in v and "value" in v:
-                pairs.append(v)
-
-        return pairs
+def build_pairs(df):
+    grouped = {}
+    for _, r in df.iterrows():
+        grouped.setdefault(r["priority"], {})[r["rule_name"]] = r["rule_value"]
+    return [v for v in grouped.values() if "keyword" in v and "value" in v]
 
 
 # ---------------------------
-# Reader
+# Country validation (NO hardcoding)
 # ---------------------------
-class HTMLReader:
-    def read(self, file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            return BeautifulSoup(f, "html.parser")
-
-
-# ---------------------------
-# Extractor (Anchor-based)
-# ---------------------------
-class AnchorExtractor:
-    def extract(self, soup, rules, pairs, field_name):
-        results = []
-
-        anchors = soup.select(rules["anchor_selector"][0])
-
-        for anchor in anchors:
-            text = anchor.text.lower()
-
-            matched_value = None
-
-            # match using priority pairs
-            for pair in pairs:
-                if pair["keyword"].lower() in text:
-                    matched_value = pair["value"]
-                    break
-
-            if not matched_value:
-                continue
-
-            # move to next list
-            list_node = anchor.find_next(rules["list_selector"][0])
-            if not list_node:
-                continue
-
-            items = list_node.select(rules["item_selector"][0])
-
-            for item in items:
-                country = item.text.strip()
-
-                results.append({
-                    "country": country,
-                    field_name: f"{country} ({matched_value})"
-                })
-
-        return pd.DataFrame(results)
+def is_country(text):
+    try:
+        iso = cc.convert(names=text, to='ISO2')
+        return iso != "not found"
+    except:
+        return False
 
 
 # ---------------------------
-# File Resolver (Stub)
+# E2E extractor
 # ---------------------------
-class FileResolver:
-    def get_path(self, file_alias):
-        return f"/path/to/{file_alias}.html"
+def extract_html(file_path, config_df):
 
+    with open(file_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f, "html.parser")
 
-# ---------------------------
-# Pipeline
-# ---------------------------
-class HTMLPipeline:
-    def __init__(self, spark, config_table):
-        self.spark = spark
-        self.config_table = config_table
+    rules = config_df.groupby("rule_name")["rule_value"].apply(list).to_dict()
+    pairs = build_pairs(config_df)
 
-        self.reader = HTMLReader()
-        self.extractor = AnchorExtractor()
-        self.file_resolver = FileResolver()
+    results = []
 
-    def load_config(self):
-        return self.spark.table(self.config_table) \
-            .filter("is_active = 'Y' AND source_type = 'html'") \
-            .toPandas()
+    anchors = soup.select(rules["anchor_selector"][0])
 
-    def run(self):
-        config_df = self.load_config()
-        config = HTMLConfig(config_df)
+    for anchor in anchors:
 
-        final_df = None
+        text = anchor.get_text(" ", strip=True).lower()
 
-        for file_alias, df in config.group_by_file():
+        matched_value = None
+        for pair in pairs:
+            if pair["keyword"] in text:
+                matched_value = pair["value"]
+                break
 
-            rules = config.get_rules(df)
-            pairs = config.build_pairs(df)
-            field_name = config.get_field_name(df)
+        if not matched_value:
+            continue
 
-            file_path = self.file_resolver.get_path(file_alias)
-            soup = self.reader.read(file_path)
+        current = anchor
 
-            mode = rules["mode"][0]
+        # 🔥 scoped traversal
+        while True:
+            current = current.find_next_sibling()
 
-            if mode == "anchor":
-                mapped = self.extractor.extract(
-                    soup, rules, pairs, field_name
-                )
-            else:
-                raise ValueError("Unsupported mode")
+            if not current:
+                break
 
-            final_df = mapped if final_df is None else final_df.merge(
-                mapped, on="country", how="outer"
-            )
+            if current.name in ["h1", "h2", "h3"]:
+                break
 
-        return self.spark.createDataFrame(final_df)
+            # 🔥 handle nested structures also
+            lists = current.find_all(rules["list_selector"][0])
 
+            for ul in lists:
+                for li in ul.select(rules["item_selector"][0]):
 
-# ---------------------------
-# Usage
-# ---------------------------
-if __name__ == "__main__":
-    spark = SparkSession.builder.getOrCreate()
+                    country = li.get_text(" ", strip=True)
 
-    pipeline = HTMLPipeline(
-        spark=spark,
-        config_table="your_hive_config_table"
-    )
+                    # 🔥 ONLY validation (no keyword hacks)
+                    if not is_country(country):
+                        continue
 
-    result_df = pipeline.run()
-    result_df.show()
+                    results.append({
+                        "country": country,
+                        "list_type": matched_value
+                    })
+
+    return pd.DataFrame(results)
