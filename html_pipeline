@@ -1,12 +1,9 @@
 from bs4 import BeautifulSoup
 import pandas as pd
-import country_converter as coco
-
-cc = coco.CountryConverter()
 
 
 # ---------------------------
-# Build keyword-value pairs
+# Helpers
 # ---------------------------
 def build_pairs(df):
     grouped = {}
@@ -15,72 +12,85 @@ def build_pairs(df):
     return [v for v in grouped.values() if "keyword" in v and "value" in v]
 
 
-# ---------------------------
-# Country validation (NO hardcoding)
-# ---------------------------
-def is_country(text):
-    try:
-        iso = cc.convert(names=text, to='ISO2')
-        return iso != "not found"
-    except:
-        return False
+def get_rules(df):
+    return df.groupby("rule_name")["rule_value"].apply(list).to_dict()
+
+
+def parse_patterns(rules, key):
+    if key not in rules:
+        return []
+    # take first entry and split by pipe
+    return [p.strip().lower() for p in rules[key][0].split("|") if p.strip()]
 
 
 # ---------------------------
-# E2E extractor
+# Core Extractor
 # ---------------------------
-def extract_html(file_path, config_df):
+class HTMLExtractor:
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        soup = BeautifulSoup(f, "html.parser")
+    def extract(self, file_path, config_df):
 
-    rules = config_df.groupby("rule_name")["rule_value"].apply(list).to_dict()
-    pairs = build_pairs(config_df)
+        # load html
+        with open(file_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
 
-    results = []
+        rules = get_rules(config_df)
+        pairs = build_pairs(config_df)
 
-    anchors = soup.select(rules["anchor_selector"][0])
+        href_patterns = parse_patterns(rules, "item_href_contains")
 
-    for anchor in anchors:
+        results = []
 
-        text = anchor.get_text(" ", strip=True).lower()
+        anchors = soup.select(rules["anchor_selector"][0])
 
-        matched_value = None
-        for pair in pairs:
-            if pair["keyword"] in text:
-                matched_value = pair["value"]
-                break
+        for anchor in anchors:
 
-        if not matched_value:
-            continue
+            anchor_text = anchor.get_text(" ", strip=True).lower()
 
-        current = anchor
+            matched_value = None
+            for pair in pairs:
+                if pair["keyword"] in anchor_text:
+                    matched_value = pair["value"]
+                    break
 
-        # 🔥 scoped traversal
-        while True:
-            current = current.find_next_sibling()
+            if not matched_value:
+                continue
 
-            if not current:
-                break
+            current = anchor
 
-            if current.name in ["h1", "h2", "h3"]:
-                break
+            # 🔥 scoped traversal
+            while True:
+                current = current.find_next_sibling()
 
-            # 🔥 handle nested structures also
-            lists = current.find_all(rules["list_selector"][0])
+                if not current:
+                    break
 
-            for ul in lists:
-                for li in ul.select(rules["item_selector"][0]):
+                if current.name in ["h1", "h2", "h3"]:
+                    break
 
-                    country = li.get_text(" ", strip=True)
+                lists = current.find_all(rules["list_selector"][0])
 
-                    # 🔥 ONLY validation (no keyword hacks)
-                    if not is_country(country):
-                        continue
+                for ul in lists:
+                    for li in ul.select(rules["item_selector"][0]):
 
-                    results.append({
-                        "country": country,
-                        "list_type": matched_value
-                    })
+                        links = li.select(rules["link_selector"][0])
 
-    return pd.DataFrame(results)
+                        for a in links:
+                            href = (a.get("href") or "").lower()
+
+                            # 🔥 config-driven pattern match
+                            if href_patterns:
+                                if not any(p in href for p in href_patterns):
+                                    continue
+
+                            country = a.get_text(" ", strip=True)
+
+                            if not country:
+                                continue
+
+                            results.append({
+                                "country": country,
+                                "list_type": matched_value
+                            })
+
+        return pd.DataFrame(results)
