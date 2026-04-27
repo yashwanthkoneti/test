@@ -3,26 +3,59 @@ import pandas as pd
 
 
 # ---------------------------
-# Config helpers
+# Config Layer
 # ---------------------------
-def get_rules(config_df):
-    return config_df.groupby("rule_name")["rule_value"].apply(list).to_dict()
+class PDFConfig:
+    def __init__(self, df):
+        self.rules = df.groupby("rule_name")["rule_value"].apply(list).to_dict()
+
+    def get(self, key, default=None):
+        return self.rules.get(key, [default])[0]
+
+    def get_list(self, key):
+        val = self.get(key, "")
+        return [v.strip() for v in val.split("|") if v]
 
 
 # ---------------------------
-# Table extraction
+# Header Processor
+# ---------------------------
+class HeaderProcessor:
+
+    def merge_headers(self, rows):
+        """
+        Merge multi-row headers into single header
+        """
+        merged = []
+
+        for col_idx in range(len(rows[0])):
+            parts = []
+            for r in rows:
+                val = str(r[col_idx]).strip() if r[col_idx] else ""
+                if val:
+                    parts.append(val)
+            merged.append(" ".join(parts))
+
+        return merged
+
+
+# ---------------------------
+# Table Extractor
 # ---------------------------
 class PDFTableExtractor:
 
-    def extract(self, pdf_path, config_df):
+    def __init__(self, config):
+        self.config = config
+        self.header_processor = HeaderProcessor()
+        self.global_header = None
 
-        rules = get_rules(config_df)
+    def extract(self, pdf_path):
 
         results = []
 
         with pdfplumber.open(pdf_path) as pdf:
 
-            for page in pdf.pages:
+            for page_idx, page in enumerate(pdf.pages):
 
                 tables = page.extract_tables()
 
@@ -33,35 +66,37 @@ class PDFTableExtractor:
 
                     df = pd.DataFrame(table)
 
-                    # header handling
-                    header_row = int(rules.get("header_row", [0])[0])
-                    df.columns = df.iloc[header_row]
-                    df = df.drop(index=range(header_row + 1))
+                    header_rows = int(self.config.get("header_rows", 1))
 
-                    df.columns = [str(c).strip() for c in df.columns]
+                    # ---------------------------
+                    # Header handling
+                    # ---------------------------
+                    header_data = df.iloc[:header_rows].values.tolist()
 
-                    # column resolution
-                    if "country_col" in rules:
-                        country_col = rules["country_col"][0]
-                    else:
-                        country_col = df.columns[int(rules["country_col_idx"][0])]
+                    if self.global_header is None:
+                        if self.config.get("header_strategy") == "merge":
+                            self.global_header = self.header_processor.merge_headers(header_data)
+                        else:
+                            self.global_header = df.iloc[header_rows - 1].tolist()
 
-                    if "value_col" in rules:
-                        value_col = rules["value_col"][0]
-                    else:
-                        value_col = df.columns[int(rules["value_col_idx"][0])]
+                    df.columns = self.global_header
 
-                    for _, row in df.iterrows():
+                    # ---------------------------
+                    # Remove header rows
+                    # ---------------------------
+                    df = df.iloc[header_rows:].reset_index(drop=True)
 
-                        country = str(row.get(country_col, "")).strip()
-                        value = str(row.get(value_col, "")).strip()
+                    # ---------------------------
+                    # Skip repeated headers
+                    # ---------------------------
+                    if self.config.get("skip_repeated_header") == "true":
+                        df = df[df.iloc[:, 0] != self.global_header[0]]
 
-                        if not country:
-                            continue
+                    # ---------------------------
+                    # Clean rows
+                    # ---------------------------
+                    df = df.dropna(how="all")
 
-                        results.append({
-                            "country": country,
-                            "value": value
-                        })
+                    results.append(df)
 
-        return pd.DataFrame(results)
+        return pd.concat(results, ignore_index=True)
