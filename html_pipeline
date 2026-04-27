@@ -1,5 +1,5 @@
-from bs4 import BeautifulSoup
 import pandas as pd
+from bs4 import BeautifulSoup
 from pyspark.sql import SparkSession
 
 
@@ -7,31 +7,39 @@ from pyspark.sql import SparkSession
 # Config Layer
 # ---------------------------
 class HTMLConfig:
-    def __init__(self, config_df):
-        self.config_df = config_df
+    def __init__(self, df):
+        self.df = df
 
     def group_by_file(self):
-        return self.config_df.groupby("file_alias")
+        return self.df.groupby("file_alias")
 
     def get_rules(self, df):
-        return {r["rule_name"]: r["rule_value"] for _, r in df.iterrows()}
+        rules = {}
+        for _, r in df.iterrows():
+            rules.setdefault(r["rule_name"], []).append(r["rule_value"])
+        return rules
 
-    def get_field_mappings(self, df):
-        field_df = df[df["rule_name"].isin(["country_col", "value_col"])]
+    def get_field_name(self, df):
+        return df["field_name"].iloc[0]
 
-        mappings = {}
-        for field in field_df["field_name"].unique():
-            sub = field_df[field_df["field_name"] == field]
-            mappings[field] = {
-                r["rule_name"]: r["rule_value"]
-                for _, r in sub.iterrows()
-            }
+    # 🔥 Priority pairing (same config)
+    def build_pairs(self, df):
+        grouped = {}
 
-        return mappings
+        for _, r in df.iterrows():
+            p = r["priority"]
+            grouped.setdefault(p, {})[r["rule_name"]] = r["rule_value"]
+
+        pairs = []
+        for _, v in grouped.items():
+            if "keyword" in v and "value" in v:
+                pairs.append(v)
+
+        return pairs
 
 
 # ---------------------------
-# Reader Layer
+# Reader
 # ---------------------------
 class HTMLReader:
     def read(self, file_path):
@@ -40,60 +48,48 @@ class HTMLReader:
 
 
 # ---------------------------
-# Extractor Layer
+# Extractor (Anchor-based)
 # ---------------------------
-class SectionExtractor:
-    def extract(self, soup, rules):
+class AnchorExtractor:
+    def extract(self, soup, rules, pairs, field_name):
         results = []
 
-        sections = soup.find_all(rules["section_tag"])
+        anchors = soup.select(rules["anchor_selector"][0])
 
-        for section in sections:
-            title = section.text.lower()
+        for anchor in anchors:
+            text = anchor.text.lower()
 
-            if rules["black_keyword"] in title:
-                tag = "black_list"
-            elif rules["grey_keyword"] in title:
-                tag = "grey_list"
-            else:
+            matched_value = None
+
+            # match using priority pairs
+            for pair in pairs:
+                if pair["keyword"].lower() in text:
+                    matched_value = pair["value"]
+                    break
+
+            if not matched_value:
                 continue
 
-            ul = section.find_next(rules.get("list_tag", "ul"))
+            # move to next list
+            list_node = anchor.find_next(rules["list_selector"][0])
+            if not list_node:
+                continue
 
-            for li in ul.find_all(rules.get("item_tag", "li")):
-                country = li.text.strip()
+            items = list_node.select(rules["item_selector"][0])
+
+            for item in items:
+                country = item.text.strip()
+
                 results.append({
                     "country": country,
-                    "scb_presence": f"{country} ({tag})"
+                    field_name: f"{country} ({matched_value})"
                 })
 
         return pd.DataFrame(results)
 
 
-class SelectorExtractor:
-    def extract(self, soup, rules, mappings):
-        rows = soup.select(rules["row_selector"])
-        results = []
-
-        for row in rows:
-            entry = {}
-
-            for field, m in mappings.items():
-                c = row.select_one(m["country_col"])
-                v = row.select_one(m["value_col"])
-
-                if c and v:
-                    entry["country"] = c.text.strip()
-                    entry[field] = v.text.strip()
-
-            if entry:
-                results.append(entry)
-
-        return pd.DataFrame(results)
-
-
 # ---------------------------
-# File Resolver
+# File Resolver (Stub)
 # ---------------------------
 class FileResolver:
     def get_path(self, file_alias):
@@ -109,8 +105,7 @@ class HTMLPipeline:
         self.config_table = config_table
 
         self.reader = HTMLReader()
-        self.section_extractor = SectionExtractor()
-        self.selector_extractor = SelectorExtractor()
+        self.extractor = AnchorExtractor()
         self.file_resolver = FileResolver()
 
     def load_config(self):
@@ -127,18 +122,38 @@ class HTMLPipeline:
         for file_alias, df in config.group_by_file():
 
             rules = config.get_rules(df)
-            mappings = config.get_field_mappings(df)
+            pairs = config.build_pairs(df)
+            field_name = config.get_field_name(df)
 
             file_path = self.file_resolver.get_path(file_alias)
             soup = self.reader.read(file_path)
 
-            if "section_tag" in rules:
-                mapped = self.section_extractor.extract(soup, rules)
-            elif "row_selector" in rules:
-                mapped = self.selector_extractor.extract(soup, rules, mappings)
-            else:
-                raise ValueError("Invalid HTML config")
+            mode = rules["mode"][0]
 
-            final_df = mapped if final_df is None else final_df.merge(mapped, on="country", how="outer")
+            if mode == "anchor":
+                mapped = self.extractor.extract(
+                    soup, rules, pairs, field_name
+                )
+            else:
+                raise ValueError("Unsupported mode")
+
+            final_df = mapped if final_df is None else final_df.merge(
+                mapped, on="country", how="outer"
+            )
 
         return self.spark.createDataFrame(final_df)
+
+
+# ---------------------------
+# Usage
+# ---------------------------
+if __name__ == "__main__":
+    spark = SparkSession.builder.getOrCreate()
+
+    pipeline = HTMLPipeline(
+        spark=spark,
+        config_table="your_hive_config_table"
+    )
+
+    result_df = pipeline.run()
+    result_df.show()
