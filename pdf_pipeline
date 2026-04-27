@@ -1,0 +1,67 @@
+import pdfplumber
+import pandas as pd
+
+
+# ---------------------------
+# Config helpers
+# ---------------------------
+def get_rules(config_df):
+    return config_df.groupby("rule_name")["rule_value"].apply(list).to_dict()
+
+
+# ---------------------------
+# Table extraction
+# ---------------------------
+class PDFTableExtractor:
+
+    def extract(self, pdf_path, config_df):
+
+        rules = get_rules(config_df)
+
+        results = []
+
+        with pdfplumber.open(pdf_path) as pdf:
+
+            for page in pdf.pages:
+
+                tables = page.extract_tables()
+
+                for table in tables:
+
+                    if not table or len(table) < 2:
+                        continue
+
+                    df = pd.DataFrame(table)
+
+                    # header handling
+                    header_row = int(rules.get("header_row", [0])[0])
+                    df.columns = df.iloc[header_row]
+                    df = df.drop(index=range(header_row + 1))
+
+                    df.columns = [str(c).strip() for c in df.columns]
+
+                    # column resolution
+                    if "country_col" in rules:
+                        country_col = rules["country_col"][0]
+                    else:
+                        country_col = df.columns[int(rules["country_col_idx"][0])]
+
+                    if "value_col" in rules:
+                        value_col = rules["value_col"][0]
+                    else:
+                        value_col = df.columns[int(rules["value_col_idx"][0])]
+
+                    for _, row in df.iterrows():
+
+                        country = str(row.get(country_col, "")).strip()
+                        value = str(row.get(value_col, "")).strip()
+
+                        if not country:
+                            continue
+
+                        results.append({
+                            "country": country,
+                            "value": value
+                        })
+
+        return pd.DataFrame(results)
