@@ -1,0 +1,88 @@
+from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType
+
+# -------------------------
+# Load data
+# -------------------------
+df = spark.table("long_table") \
+    .filter((F.col("ods") == "ODS1") & (F.col("seq") == 1))
+
+# -------------------------
+# Load config
+# -------------------------
+config_df = spark.table("aggregation_config")
+
+config = {}
+for row in config_df.collect():
+    config[row["field_name"]] = (row["rule_name"], row["rule_value"])
+
+# -------------------------
+# Build priority maps
+# -------------------------
+def build_priority_map(rule):
+    values = rule.split(">")
+    return {v: len(values) - i for i, v in enumerate(values)}
+
+priority_maps = {
+    field: build_priority_map(rule_value)
+    for field, (rule_name, rule_value) in config.items()
+    if rule_name == "priority"
+}
+
+broadcast_maps = spark.sparkContext.broadcast(priority_maps)
+
+# -------------------------
+# Priority UDF
+# -------------------------
+def get_priority(field, value):
+    mapping = broadcast_maps.value.get(field, {})
+    return mapping.get(value, 0)
+
+priority_udf = F.udf(get_priority, IntegerType())
+
+# Add priority column
+df = df.withColumn(
+    "priority_value",
+    priority_udf(F.col("field_name"), F.col("field_value"))
+)
+
+# -------------------------
+# Split logic
+# -------------------------
+priority_fields = [k for k, v in config.items() if v[0] == "priority"]
+first_fields = [k for k, v in config.items() if v[0] == "aggregation_type"]
+
+# -------------------------
+# PRIORITY handling
+# -------------------------
+df_priority = df.filter(F.col("field_name").isin(priority_fields))
+
+df_priority = df_priority.groupBy("iso2_code", "field_name") \
+    .agg(F.max("priority_value").alias("max_priority"))
+
+df_priority = df.join(df_priority, ["iso2_code", "field_name"]) \
+    .filter(F.col("priority_value") == F.col("max_priority")) \
+    .dropDuplicates(["iso2_code", "field_name"]) \
+    .select("iso2_code", "field_name", "field_value")
+
+# -------------------------
+# FIRST handling
+# -------------------------
+df_first = df.filter(F.col("field_name").isin(first_fields)) \
+    .orderBy("seq") \
+    .groupBy("iso2_code", "field_name") \
+    .agg(F.first("field_value").alias("field_value"))
+
+# -------------------------
+# Combine
+# -------------------------
+df_final = df_priority.unionByName(df_first)
+
+# -------------------------
+# Pivot
+# -------------------------
+wide_df = df_final.groupBy("iso2_code") \
+    .pivot("field_name") \
+    .agg(F.first("field_value"))
+
+wide_df.show()
