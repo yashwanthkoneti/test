@@ -1,136 +1,98 @@
-import pdfplumber
-import pandas as pd
+
+#!/usr/bin/env python3
 import re
+import sys
+import pdfplumber
+import json
 
-START_MARKER = "TABLE 4"
-END_MARKER = "NOTES"
-EXPECTED_VALUES = 26
+START_RE = re.compile(r"TABLE\s*4", re.I)
+END_RE = re.compile(r"^\s*NOTES\b", re.I)
+SERIAL_RE = re.compile(r"^\s*(\d+)\.\s*$|^\s*(\d+)\.\s+(.*)")
+NUM_RE = re.compile(r"[+-]?\d+\.\d+")
 
-NUMBER_RE = re.compile(r"-?\d+\.\d+")
-ROW_RE = re.compile(r"^\d+\.")
-
-def extract_section(pdf_path):
-    reading = False
-    lines = []
-
+def iter_lines(pdf_path):
+    started = False
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text = page.extract_text(layout=True) or ""
+            for raw in text.splitlines():
+                line = raw.rstrip()
+                if not started:
+                    if START_RE.search(line):
+                        started = True
+                    continue
+                if END_RE.match(line):
+                    return
+                yield line
 
-            if START_MARKER in text:
-                reading = True
-
-            if not reading:
-                continue
-
-            for line in text.split("\n"):
-                if END_MARKER in line:
-                    reading = False
-                    break
-
-                line = re.sub(r"\s+", " ", line).strip()
-
-                if line:
-                    lines.append(line)
-
-            if not reading:
-                break
-
-    return lines
-
-
-def merge_lines(lines):
-    merged = []
-
-    for line in lines:
-
-        if ROW_RE.match(line):
-            merged.append(line)
-        else:
-            if merged:
-                merged[-1] += " " + line
-
-    return merged
-
-
-def parse(lines):
-
+def parse(pdf_path):
     records = []
-
-    for line in lines:
-
-        if not ROW_RE.match(line):
-            continue
-
-        nums = NUMBER_RE.findall(line)
-
-        if len(nums) < EXPECTED_VALUES:
-            continue
-
-        nums = nums[:EXPECTED_VALUES]
-
-        m = NUMBER_RE.search(line)
-
-        left = line[:m.start()].strip()
-
-        rank = re.findall(r"^\d+", left)[0]
-
-        country = re.sub(r"^\d+\.\s*", "", left)
-        country = re.sub(r"\s+", " ", country).strip()
-
-        rec = {
-            "Rank": int(rank),
-            "Country": country
-        }
-
-        for i, v in enumerate(nums, 1):
-            rec[f"Value_{i}"] = float(v)
-
-        records.append(rec)
-
-    return pd.DataFrame(records)
-
-
-def main(pdf_path):
-
-    lines = extract_section(pdf_path)
-
-    lines = merge_lines(lines)
-
-    df = parse(lines)
-
-    print(df.head())
-    print()
-    print("Rows:", len(df))
-
-    df.to_csv("table4_output.csv", index=False)
-
     failed = []
+    lines = iter_lines(pdf_path)
+
+    current = None
+    collecting_country = False
 
     for line in lines:
+        m = SERIAL_RE.match(line)
+        if current is None:
+            if m:
+                serial = m.group(1) or m.group(2)
+                rest = (m.group(3) or "").strip()
+                current = {
+                    "serial": serial,
+                    "country": rest,
+                    "numbers": [],
+                    "raw": [line]
+                }
+                collecting_country = True
+            continue
 
-        if ROW_RE.match(line):
+        current["raw"].append(line)
 
-            nums = NUMBER_RE.findall(line)
+        if collecting_country:
+            nums = NUM_RE.findall(line)
+            if nums:
+                if current["country"]:
+                    current["country"] = " ".join(current["country"].split())
+                current["numbers"].extend(nums)
+                collecting_country = False
+            else:
+                current["country"] = (current["country"] + " " + line.strip()).strip()
+            continue
 
-            if len(nums) < EXPECTED_VALUES:
-                failed.append(line)
+        nums = NUM_RE.findall(line)
+        if nums:
+            current["numbers"].extend(nums)
 
-    print("Failed rows:", len(failed))
+        if len(current["numbers"]) >= 26:
+            records.append(current)
+            extra = current["numbers"][26:]
+            current = None
+            collecting_country = False
+            if extra:
+                failed.append({
+                    "reason":"extra numeric tokens after record completion",
+                    "extra":extra
+                })
 
-    if failed:
-        with open("failed_rows.txt", "w", encoding="utf-8") as f:
-            for r in failed:
-                f.write(r + "\\n")
+    if current:
+        failed.append(current)
 
-        print("Saved failed_rows.txt")
+    with open("raw_records.json","w",encoding="utf-8") as f:
+        json.dump(records,f,indent=2,ensure_ascii=False)
 
+    with open("failed_rows.txt","w",encoding="utf-8") as f:
+        for r in failed:
+            f.write(json.dumps(r,ensure_ascii=False))
+            f.write("\n\n")
+
+    print(f"Records: {len(records)}")
+    print(f"Failed: {len(failed)}")
+    print("Output: raw_records.json, failed_rows.txt")
 
 if __name__ == "__main__":
-
-    import sys
-
-    if len(sys.argv) != 2:
-        print("Usage: python parser.py <pdf>")
-    else:
-        main(sys.argv[1])
+    if len(sys.argv) < 2:
+        print("Usage: python parse_table4_stream.py input.pdf")
+        sys.exit(1)
+    parse(sys.argv[1])
