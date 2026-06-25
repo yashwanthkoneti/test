@@ -1,230 +1,97 @@
+import re
 import pdfplumber
 import pandas as pd
-import re
 from collections import defaultdict
-
-PDF_FILE = "global-ocindex-report.pdf"
 
 START_MARKER = "TABLE 4"
 END_MARKER = "NOTES"
+EXPECTED_NUMERIC_FIELDS = 26
 
-# -----------------------------
-# Utilities
-# -----------------------------
+NUMBER_RE = re.compile(r"^-?\d+\.\d+$")
 
-def group_rows(words, tolerance=3):
-    """
-    Group words having similar y-coordinate.
-    """
-    rows = []
+def is_number(s):
+    return bool(NUMBER_RE.match(s))
 
-    words = sorted(words, key=lambda x: (round(x["top"], 1), x["x0"]))
+def extract_words(pdf_path):
+    words = []
+    reading = False
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            if START_MARKER in txt:
+                reading = True
+            if not reading:
+                continue
+            for w in page.extract_words(use_text_flow=True,
+                                        x_tolerance=2,
+                                        y_tolerance=2):
+                words.append(w)
+            if END_MARKER in txt:
+                break
+    return words
 
-    current = []
-    current_y = None
-
+def group_rows(words, tol=3):
+    rows=[]
+    words=sorted(words,key=lambda w:(w["doctop"],w["x0"]))
+    cur=[]
+    y=None
     for w in words:
-
-        if current_y is None:
-            current_y = w["top"]
-
-        if abs(w["top"] - current_y) <= tolerance:
-            current.append(w)
+        if y is None:
+            y=w["doctop"]
+        if abs(w["doctop"]-y)<=tol:
+            cur.append(w)
         else:
-            rows.append(current)
-            current = [w]
-            current_y = w["top"]
-
-    if current:
-        rows.append(current)
-
+            rows.append(cur)
+            cur=[w]
+            y=w["doctop"]
+    if cur:
+        rows.append(cur)
     return rows
 
+def row_numbers(row):
+    return [w for w in sorted(row,key=lambda x:x["x0"]) if is_number(w["text"])]
 
-def row_text(row):
-    return " ".join([w["text"] for w in sorted(row, key=lambda x: x["x0"])])
+def infer_columns(rows):
+    for row in rows:
+        nums=row_numbers(row)
+        if len(nums)>=20:
+            return [(n["x0"]+n["x1"])/2 for n in nums[:EXPECTED_NUMERIC_FIELDS]]
+    raise RuntimeError("Unable to infer numeric columns")
 
+def nearest(x, cols):
+    return min(range(len(cols)), key=lambda i:abs(cols[i]-x))
 
-# -----------------------------
-# Read TABLE 4 pages
-# -----------------------------
-
-table_words = []
-
-reading = False
-
-with pdfplumber.open(PDF_FILE) as pdf:
-
-    for page in pdf.pages:
-
-        txt = page.extract_text() or ""
-
-        if START_MARKER in txt:
-            reading = True
-
-        if not reading:
+def parse_rows(rows, cols):
+    records=[]
+    first=cols[0]
+    for row in rows:
+        nums=defaultdict(str)
+        country=[]
+        for w in sorted(row,key=lambda x:x["x0"]):
+            cx=(w["x0"]+w["x1"])/2
+            if is_number(w["text"]):
+                nums[nearest(cx,cols)]=w["text"]
+            elif cx<first:
+                country.append(w["text"])
+        if len(nums)!=EXPECTED_NUMERIC_FIELDS:
             continue
+        rec={"Country":" ".join(country)}
+        for i in range(EXPECTED_NUMERIC_FIELDS):
+            rec[f"V{i+1}"]=float(nums[i])
+        records.append(rec)
+    return pd.DataFrame(records)
 
-        words = page.extract_words(
-            x_tolerance=2,
-            y_tolerance=2,
-            keep_blank_chars=False,
-            use_text_flow=True
-        )
+def main(pdf_path):
+    words=extract_words(pdf_path)
+    rows=group_rows(words)
+    cols=infer_columns(rows)
+    df=parse_rows(rows,cols)
+    print(df.head())
+    return df
 
-        for w in words:
-            w["page"] = page.page_number
-
-        table_words.extend(words)
-
-        if END_MARKER in txt:
-            break
-
-# ----------------------------------------------------------
-# Remove everything before Country header
-# ----------------------------------------------------------
-
-rows = group_rows(table_words)
-
-header_start = None
-
-for i, row in enumerate(rows):
-
-    txt = row_text(row)
-
-    if "Country" in txt:
-        header_start = i
-        break
-
-if header_start is None:
-    raise Exception("Header not found.")
-
-rows = rows[header_start:]
-
-# ----------------------------------------------------------
-# Build header
-# ----------------------------------------------------------
-
-header_rows = []
-
-header_complete = False
-
-for row in rows:
-
-    txt = row_text(row)
-
-    header_rows.append(row)
-
-    if "Overall resilience score" in txt or "Overall" in txt:
-        if "Country" in txt:
-            header_complete = True
-            break
-
-# Sometimes header spans multiple rows.
-# Merge all header rows.
-
-header_words = []
-
-for r in header_rows:
-    header_words.extend(r)
-
-# ----------------------------------------------------------
-# Discover columns
-# ----------------------------------------------------------
-
-clusters = []
-
-header_words = sorted(header_words, key=lambda x: x["x0"])
-
-THRESHOLD = 15
-
-for w in header_words:
-
-    x = w["x0"]
-
-    found = False
-
-    for c in clusters:
-
-        if abs(c["center"] - x) < THRESHOLD:
-            c["words"].append(w)
-            c["center"] = sum(v["x0"] for v in c["words"]) / len(c["words"])
-            found = True
-            break
-
-    if not found:
-        clusters.append({
-            "center": x,
-            "words": [w]
-        })
-
-clusters = sorted(clusters, key=lambda x: x["center"])
-
-columns = []
-
-for c in clusters:
-
-    txt = " ".join(v["text"] for v in sorted(c["words"], key=lambda x: (x["top"], x["x0"])))
-
-    txt = re.sub(r"\s+", " ", txt)
-
-    columns.append({
-        "name": txt.strip(),
-        "center": c["center"]
-    })
-
-print("Detected Columns")
-
-for c in columns:
-    print(c)
-
-# ----------------------------------------------------------
-# Remaining rows
-# ----------------------------------------------------------
-
-data_rows = rows[len(header_rows):]
-
-records = []
-
-for row in data_rows:
-
-    cells = defaultdict(list)
-
-    for w in row:
-
-        nearest = min(
-            range(len(columns)),
-            key=lambda i: abs(columns[i]["center"] - w["x0"])
-        )
-
-        cells[nearest].append(w)
-
-    values = []
-
-    for i in range(len(columns)):
-
-        words = sorted(cells[i], key=lambda x: x["x0"])
-
-        value = " ".join(w["text"] for w in words)
-
-        values.append(value)
-
-    # Ignore empty rows
-    if len("".join(values).strip()) == 0:
-        continue
-
-    records.append(values)
-
-# ----------------------------------------------------------
-# DataFrame
-# ----------------------------------------------------------
-
-headers = [c["name"] for c in columns]
-
-df = pd.DataFrame(records, columns=headers)
-
-print(df.head())
-
-df.to_csv("table4_resilience.csv", index=False)
-
-print("\nSaved to table4_resilience.csv")
+if __name__=="__main__":
+    import sys
+    if len(sys.argv)!=2:
+        print("Usage: python parser.py <pdf>")
+    else:
+        main(sys.argv[1])
