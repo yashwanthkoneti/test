@@ -1,97 +1,136 @@
-import re
 import pdfplumber
 import pandas as pd
-from collections import defaultdict
+import re
 
 START_MARKER = "TABLE 4"
 END_MARKER = "NOTES"
-EXPECTED_NUMERIC_FIELDS = 26
+EXPECTED_VALUES = 26
 
-NUMBER_RE = re.compile(r"^-?\d+\.\d+$")
+NUMBER_RE = re.compile(r"-?\d+\.\d+")
+ROW_RE = re.compile(r"^\d+\.")
 
-def is_number(s):
-    return bool(NUMBER_RE.match(s))
-
-def extract_words(pdf_path):
-    words = []
+def extract_section(pdf_path):
     reading = False
+    lines = []
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            txt = page.extract_text() or ""
-            if START_MARKER in txt:
+            text = page.extract_text(layout=True) or ""
+
+            if START_MARKER in text:
                 reading = True
+
             if not reading:
                 continue
-            for w in page.extract_words(use_text_flow=True,
-                                        x_tolerance=2,
-                                        y_tolerance=2):
-                words.append(w)
-            if END_MARKER in txt:
+
+            for line in text.split("\n"):
+                if END_MARKER in line:
+                    reading = False
+                    break
+
+                line = re.sub(r"\s+", " ", line).strip()
+
+                if line:
+                    lines.append(line)
+
+            if not reading:
                 break
-    return words
 
-def group_rows(words, tol=3):
-    rows=[]
-    words=sorted(words,key=lambda w:(w["doctop"],w["x0"]))
-    cur=[]
-    y=None
-    for w in words:
-        if y is None:
-            y=w["doctop"]
-        if abs(w["doctop"]-y)<=tol:
-            cur.append(w)
+    return lines
+
+
+def merge_lines(lines):
+    merged = []
+
+    for line in lines:
+
+        if ROW_RE.match(line):
+            merged.append(line)
         else:
-            rows.append(cur)
-            cur=[w]
-            y=w["doctop"]
-    if cur:
-        rows.append(cur)
-    return rows
+            if merged:
+                merged[-1] += " " + line
 
-def row_numbers(row):
-    return [w for w in sorted(row,key=lambda x:x["x0"]) if is_number(w["text"])]
+    return merged
 
-def infer_columns(rows):
-    for row in rows:
-        nums=row_numbers(row)
-        if len(nums)>=20:
-            return [(n["x0"]+n["x1"])/2 for n in nums[:EXPECTED_NUMERIC_FIELDS]]
-    raise RuntimeError("Unable to infer numeric columns")
 
-def nearest(x, cols):
-    return min(range(len(cols)), key=lambda i:abs(cols[i]-x))
+def parse(lines):
 
-def parse_rows(rows, cols):
-    records=[]
-    first=cols[0]
-    for row in rows:
-        nums=defaultdict(str)
-        country=[]
-        for w in sorted(row,key=lambda x:x["x0"]):
-            cx=(w["x0"]+w["x1"])/2
-            if is_number(w["text"]):
-                nums[nearest(cx,cols)]=w["text"]
-            elif cx<first:
-                country.append(w["text"])
-        if len(nums)!=EXPECTED_NUMERIC_FIELDS:
+    records = []
+
+    for line in lines:
+
+        if not ROW_RE.match(line):
             continue
-        rec={"Country":" ".join(country)}
-        for i in range(EXPECTED_NUMERIC_FIELDS):
-            rec[f"V{i+1}"]=float(nums[i])
+
+        nums = NUMBER_RE.findall(line)
+
+        if len(nums) < EXPECTED_VALUES:
+            continue
+
+        nums = nums[:EXPECTED_VALUES]
+
+        m = NUMBER_RE.search(line)
+
+        left = line[:m.start()].strip()
+
+        rank = re.findall(r"^\d+", left)[0]
+
+        country = re.sub(r"^\d+\.\s*", "", left)
+        country = re.sub(r"\s+", " ", country).strip()
+
+        rec = {
+            "Rank": int(rank),
+            "Country": country
+        }
+
+        for i, v in enumerate(nums, 1):
+            rec[f"Value_{i}"] = float(v)
+
         records.append(rec)
+
     return pd.DataFrame(records)
 
-def main(pdf_path):
-    words=extract_words(pdf_path)
-    rows=group_rows(words)
-    cols=infer_columns(rows)
-    df=parse_rows(rows,cols)
-    print(df.head())
-    return df
 
-if __name__=="__main__":
+def main(pdf_path):
+
+    lines = extract_section(pdf_path)
+
+    lines = merge_lines(lines)
+
+    df = parse(lines)
+
+    print(df.head())
+    print()
+    print("Rows:", len(df))
+
+    df.to_csv("table4_output.csv", index=False)
+
+    failed = []
+
+    for line in lines:
+
+        if ROW_RE.match(line):
+
+            nums = NUMBER_RE.findall(line)
+
+            if len(nums) < EXPECTED_VALUES:
+                failed.append(line)
+
+    print("Failed rows:", len(failed))
+
+    if failed:
+        with open("failed_rows.txt", "w", encoding="utf-8") as f:
+            for r in failed:
+                f.write(r + "\\n")
+
+        print("Saved failed_rows.txt")
+
+
+if __name__ == "__main__":
+
     import sys
-    if len(sys.argv)!=2:
+
+    if len(sys.argv) != 2:
         print("Usage: python parser.py <pdf>")
     else:
         main(sys.argv[1])
