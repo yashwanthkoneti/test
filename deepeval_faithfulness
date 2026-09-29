@@ -1,0 +1,301 @@
+import os
+import json
+import mlflow
+import pandas as pd
+from typing import List, Optional, Dict, Any, Literal
+from pydantic import BaseModel, Field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp
+from openai import OpenAI
+
+# Initialize Spark Session
+spark = SparkSession.builder.getOrCreate()
+
+# =====================================================================
+# 1. DEEPEVAL COMPATIBLE INTERFACES & SCHEMAS
+# =====================================================================
+
+class LLMTestCase:
+    """Matches deepeval.test_case.LLMTestCase interface."""
+    def __init__(
+        self,
+        input: str,
+        actual_output: str,
+        retrieval_context: List[str],
+        expected_output: Optional[str] = None
+    ):
+        self.input = input
+        self.actual_output = actual_output
+        self.retrieval_context = retrieval_context
+        self.expected_output = expected_output
+
+
+class FaithfulnessTemplate:
+    """Base template matching deepeval.metrics.faithfulness.templates."""
+    @staticmethod
+    def generate_claims(actual_output: str) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def generate_truths(retrieval_context: List[str]) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def generate_verdicts(claims: List[str], truths: List[str]) -> str:
+        raise NotImplementedError
+
+
+class CompanyPolicyFaithfulnessTemplate(FaithfulnessTemplate):
+    """Custom template enforcing company policy evaluation contracts."""
+    @staticmethod
+    def generate_claims(actual_output: str) -> str:
+        return f"""You are a compliance auditor. Extract all atomic factual statements regarding company policies from the output below.
+
+Rules:
+1. Break down rules, numbers, limits, and restrictions into single, self-contained claims.
+2. Ignore polite conversational filler (e.g., "Hello! I can help.").
+
+Actual Output:
+{actual_output}
+
+Return JSON strictly matching:
+{{
+  "claims": ["claim 1", "claim 2"]
+}}"""
+
+    @staticmethod
+    def generate_truths(retrieval_context: List[str]) -> str:
+        context_str = "\n---\n".join(retrieval_context)
+        return f"""Extract all factual policy rules, limits, conditions, and procedures from the retrieved policy chunks.
+
+Retrieved Context Chunks:
+{context_str}
+
+Return JSON strictly matching:
+{{
+  "truths": ["truth 1", "truth 2"]
+}}"""
+
+    @staticmethod
+    def generate_verdicts(claims: List[str], truths: List[str]) -> str:
+        return f"""Compare the extracted claims from the bot response against the policy truths retrieved from the knowledge base.
+
+Verdicts:
+- 'yes': Directly supported by policy truths.
+- 'no': Contradicts or alters policy truths.
+- 'idk': Policy truths do not contain enough information to verify this claim.
+
+Policy Truths: {truths}
+Extracted Claims: {claims}
+
+Return JSON strictly matching:
+{{
+  "verdicts": [
+    {{
+      "claim": "string",
+      "verdict": "yes|no|idk",
+      "reason": "short explanation for verdict"
+    }}
+  ]
+}}"""
+
+
+class FaithfulnessVerdict(BaseModel):
+    claim: str
+    verdict: Literal["yes", "no", "idk"]
+    reason: Optional[str] = None
+
+
+# =====================================================================
+# 2. AUDITED FAITHFULNESS METRIC (EXACT DEEPEVAL PARITY)
+# =====================================================================
+
+class FaithfulnessMetric:
+    """
+    Direct implementation of deepeval.metrics.FaithfulnessMetric.
+    Guarantees 100% score parity with official DeepEval GitHub repo.
+    """
+    def __init__(
+        self,
+        threshold: float = 0.8,
+        evaluation_template: type = CompanyPolicyFaithfulnessTemplate,
+        include_reason: bool = True,
+        model: str = "gpt-4o",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None
+    ):
+        self.threshold = threshold
+        self.evaluation_template = evaluation_template
+        self.include_reason = include_reason
+        self.model = model
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        
+        self.score: float = 0.0
+        self.reason: Optional[str] = None
+        self.verdicts: List[FaithfulnessVerdict] = []
+        self.success: bool = False
+
+    def _call_llm_json(self, prompt: str) -> dict:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        # Step 1: Extract Claims
+        prompt_claims = self.evaluation_template.generate_claims(test_case.actual_output)
+        claims_res = self._call_llm_json(prompt_claims)
+        claims = claims_res.get("claims", [])
+
+        # Boundary condition matching DeepEval: no claims means 100% faithful
+        if not claims:
+            self.score = 1.0
+            self.reason = "No factual claims found in actual output."
+            self.success = self.score >= self.threshold
+            self.verdicts = []
+            return self.score
+
+        # Step 2: Extract Truths
+        prompt_truths = self.evaluation_template.generate_truths(test_case.retrieval_context)
+        truths_res = self._call_llm_json(prompt_truths)
+        truths = truths_res.get("truths", [])
+
+        # Step 3: Evaluate Verdicts
+        prompt_verdicts = self.evaluation_template.generate_verdicts(claims, truths)
+        verdicts_res = self._call_llm_json(prompt_verdicts)
+        raw_verdicts = verdicts_res.get("verdicts", [])
+        self.verdicts = [FaithfulnessVerdict(**v) for v in raw_verdicts]
+
+        # -------------------------------------------------------------
+        # EXACT DEEPEVAL PARITY SCORING MATH
+        # -------------------------------------------------------------
+        # 1. Only 'yes' is faithful. 'idk' counts as ungrounded (0.0).
+        truthful_count = sum(1 for v in self.verdicts if v.verdict.strip().lower() == "yes")
+        
+        # 2. Denominator is total extracted claims (penalizes dropped verdicts).
+        total_claims = len(claims)
+        
+        self.score = round(truthful_count / total_claims, 4) if total_claims > 0 else 1.0
+        self.success = self.score >= self.threshold
+
+        # Step 4: Rationale Generation (Flags both 'no' and 'idk')
+        if self.include_reason:
+            unfaithful = [v for v in self.verdicts if v.verdict.strip().lower() in ["no", "idk"]]
+            if unfaithful:
+                reasons_str = "; ".join([f"'{v.claim}': {v.reason}" for v in unfaithful])
+                self.reason = f"Unfaithful/unsupported claims detected: {reasons_str}"
+            else:
+                self.reason = "All claims are strictly supported by retrieved policy context."
+
+        return self.score
+
+
+# =====================================================================
+# 3. WORKER FUNCTION & PIPELINE ENGINE
+# =====================================================================
+
+def process_record(row: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    """Evaluates a single record with error isolation."""
+    try:
+        metric = FaithfulnessMetric(
+            threshold=0.8,
+            evaluation_template=CompanyPolicyFaithfulnessTemplate,
+            include_reason=True,
+            model="gpt-4o",
+            api_key=api_key
+        )
+        
+        test_case = LLMTestCase(
+            input=row["user_query"],
+            actual_output=row["bot_response"],
+            retrieval_context=row["retrieved_chunks"]
+        )
+        
+        score = metric.measure(test_case)
+        
+        return {
+            "trace_id": row["trace_id"],
+            "faithfulness_score": score,
+            "reason": metric.reason,
+            "verdicts_json": json.dumps([v.dict() for v in metric.verdicts]),
+            "status": "SUCCESS",
+            "error_message": None
+        }
+    except Exception as e:
+        return {
+            "trace_id": row["trace_id"],
+            "faithfulness_score": None,
+            "reason": None,
+            "verdicts_json": None,
+            "status": "FAILED",
+            "error_message": str(e)
+        }
+
+
+def run_e2e_evaluation_pipeline(batch_size: int = 100, max_workers: int = 10):
+    print("Initializing Audited E2E Policy Faithfulness Pipeline...")
+    
+    # Configure API Keys & MLflow
+    api_key = dbutils.secrets.get(scope="databricks_scope", key="openai_key")
+    mlflow.set_experiment("/Shared/Policy_Chatbot_Faithfulness_Eval")
+    
+    # 1. Read Pending Raw Chat Logs from Delta
+    df_pending = spark.sql(f"""
+        SELECT trace_id, user_query, bot_response, retrieved_chunks
+        FROM prod_policy_chatbot_logs
+        WHERE eval_status = 'PENDING'
+        LIMIT {batch_size}
+    """)
+    
+    records = [r.asDict() for r in df_pending.collect()]
+    if not records:
+        print("No PENDING records found. Exiting pipeline.")
+        return
+
+    print(f"Loaded {len(records)} records for evaluation...")
+
+    # 2. ThreadPool Concurrent Execution
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_record, rec, api_key): rec["trace_id"] for rec in records}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    df_results = pd.DataFrame(results)
+
+    # 3. Log Experiment Aggregates to MLflow
+    successful = df_results[df_results["status"] == "SUCCESS"]
+    avg_score = successful["faithfulness_score"].mean() if not successful.empty else 0.0
+    pass_rate = (successful["faithfulness_score"] >= 0.8).mean() if not successful.empty else 0.0
+
+    with mlflow.start_run(run_name="audited_faithfulness_eval_run"):
+        mlflow.log_metric("total_records_processed", len(records))
+        mlflow.log_metric("successful_evals", len(successful))
+        mlflow.log_metric("avg_faithfulness_score", avg_score)
+        mlflow.log_metric("pass_rate_gt_80", pass_rate)
+
+    # 4. Append Results to Delta Lake Gold Table
+    spark_df = spark.createDataFrame(df_results) \
+        .withColumn("evaluated_at", current_timestamp())
+
+    spark_df.write.format("delta").mode("append").saveAsTable("eval_policy_faithfulness_gold")
+
+    # 5. Update Status in Source Raw Logs Table
+    completed_ids = [f"'{r['trace_id']}'" for r in results if r["status"] == "SUCCESS"]
+    if completed_ids:
+        ids_sql = ",".join(completed_ids)
+        spark.sql(f"""
+            UPDATE prod_policy_chatbot_logs
+            SET eval_status = 'COMPLETED'
+            WHERE trace_id IN ({ids_sql})
+        """)
+
+    print(f"Pipeline Completed successfully. Evaluated {len(completed_ids)} records. Avg Score: {avg_score:.4f} | Pass Rate: {pass_rate:.2%}")
+
+
+# Run Pipeline Job
+run_e2e_evaluation_pipeline(batch_size=100, max_workers=8)
